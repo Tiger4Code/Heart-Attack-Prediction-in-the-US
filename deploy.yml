@@ -1,0 +1,103 @@
+## ChatGPT output, not edited yet
+
+name: End-to-End AWS + Databricks + Kaggle Workflow
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup-and-run:
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: us-east-1
+      BUCKET_NAME: my-custom-s3-bucket-name
+      DATABRICKS_INSTANCE: https://<your-databricks-instance>  # e.g., https://adb-1234567890.0.azuredatabricks.net
+      NOTEBOOK_PATH: /Workspace/MyNotebook
+      LOCAL_NOTEBOOK_FILE: ./my_notebook.py
+      KAGGLE_DATASET: zynicide/wine-reviews  # Example dataset
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create S3 bucket
+        run: |
+          aws s3api create-bucket --bucket $BUCKET_NAME --region $AWS_REGION --create-bucket-configuration LocationConstraint=$AWS_REGION || echo "Bucket may already exist"
+
+      - name: Create S3 bucket policy
+        run: |
+          cat <<EOF > bucket-policy.json
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": ["s3:GetObject", "s3:PutObject"],
+                "Resource": "arn:aws:s3:::$BUCKET_NAME/*"
+              }
+            ]
+          }
+          EOF
+          aws s3api put-bucket-policy --bucket $BUCKET_NAME --policy file://bucket-policy.json
+
+      - name: Install Databricks CLI
+        run: |
+          pip install databricks-cli
+
+      - name: Configure Databricks CLI
+        run: |
+          mkdir -p ~/.databricks
+          cat <<EOF > ~/.databricks/config
+          [DEFAULT]
+          host = $DATABRICKS_INSTANCE
+          token = ${{ secrets.DATABRICKS_TOKEN }}
+          EOF
+
+      - name: Mount S3 bucket to Databricks (DBFS)
+        run: |
+          echo "S3 buckets cannot be directly mounted via Databricks CLI. This usually requires mounting in the notebook or setting up external locations in Unity Catalog."
+          # Optionally create external location setup script
+
+      - name: Install Kaggle CLI
+        run: |
+          pip install kaggle
+          mkdir -p ~/.kaggle
+          echo "{\"username\":\"${{ secrets.KAGGLE_USERNAME }}\",\"key\":\"${{ secrets.KAGGLE_KEY }}\"}" > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+      - name: Download Kaggle dataset
+        run: |
+          kaggle datasets download -d $KAGGLE_DATASET --unzip -p ./dataset
+
+      - name: Upload dataset to S3
+        run: |
+          aws s3 cp ./dataset s3://$BUCKET_NAME/ --recursive
+
+      - name: Upload notebook to Databricks
+        run: |
+          databricks workspace import $LOCAL_NOTEBOOK_FILE $NOTEBOOK_PATH --format SOURCE --overwrite
+
+      - name: Run Databricks notebook
+        run: |
+          JOB_ID=$(databricks jobs create --json '{
+            "name": "Run Notebook",
+            "new_cluster": {
+              "spark_version": "11.3.x-scala2.12",
+              "node_type_id": "Standard_DS3_v2",
+              "num_workers": 1
+            },
+            "notebook_task": {
+              "notebook_path": "'"$NOTEBOOK_PATH"'"
+            }
+          }' | jq -r .job_id)
+
+          databricks jobs run-now --job-id $JOB_ID
